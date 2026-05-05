@@ -5,13 +5,17 @@ import argparse
 from tqdm import tqdm
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
-from TBSN import TBSN_NSP
-from dataloader import SIDD_Ben_folder
+from glob import glob
+from natsort import natsorted
 from torchvision.utils import save_image
 
+from TBSN import TBSN_NSP
+from dataloader import DatasetForValidation
+from utils import batch_SSIM, batch_PSNR
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--in_dir', type=str, default='datasets/DND_folder') # DND
+parser.add_argument('--in_dir', type=str, default='./datasets/SIDD/valid_data/sidd_v_noisy/*.png') # DE
+parser.add_argument('--tg_dir', type=str, default='./datasets/SIDD/valid_data/sidd_v_clean/*.png') # SIDD GT
 parser.add_argument('--ids', type=int, default=2, help='test stride')
 parser.add_argument('--model', type=str, default='./ckpts/nsp_tbsn_noseed_it66_3712_8853.pth',)
 parser.add_argument('--sr_rec', type=bool, default=False, help='sr reconstruction')
@@ -19,9 +23,10 @@ args = parser.parse_args()
 
 from datetime import datetime
 now = datetime.now()
-args.result_dir = "results/"+now.strftime("%Y-%m-%d_%H-%M-%S")+"-dnd-tbsn"
+args.result_dir = "results/"+now.strftime("%Y-%m-%d_%H-%M-%S")+"-siddv-tbsn"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def pixel_unshuffle(x): # x:[B,C,H,W]
     sz = x.size()[-2:]
@@ -38,6 +43,7 @@ def pixel_unshuffle(x): # x:[B,C,H,W]
 
     return y, sz # [B*4, C, H/2, W/2]  (H,W)
 
+
 def pixel_shuffle(x, sz, sr_rec): # x:[B,C,H,W]  (H,W)
     B, C, H, W = x.size()
     B = B // (args.ids * args.ids)
@@ -50,12 +56,15 @@ def pixel_shuffle(x, sz, sr_rec): # x:[B,C,H,W]  (H,W)
         x = x.view(B, args.ids * args.ids, C, H, W) # [B, 4, C, H, W]
         return x.mean(dim=1)[..., :sz[0], :sz[1]] # [B,C,H,W]
 
+
 def test(loader, model):
     model.eval()
+    avg_psnr, avg_ssim = 0, 0
+    nums = len(loader)
     cnt = 0
     os.makedirs(args.result_dir, exist_ok=True)
 
-    for input, save_way in tqdm(loader):
+    for input, label, save_way in tqdm(loader):
         B,C,H,W = input.shape
         with torch.no_grad():
             input *= 255.0
@@ -63,19 +72,26 @@ def test(loader, model):
             ''' use PD '''
             im, sz = pixel_unshuffle(input) # [B*4, C, H/2, W/2]  (H,W)
             im_denoised = pixel_shuffle(model(im), sz, args.sr_rec) # [B*4, C, H, W]-avg->[B,C,H,W]
-            if args.sr_rec:
-                sr_pd, sz2 = pixel_unshuffle(im_denoised) # [B*4, C, H/2, W/2]
-                im_denoised = pixel_shuffle(model(sr_pd), sz2, sr_rec=False) # ->[B*4,C,H,W]->[B,C,H,W]
-            ''' direct (better) '''
-            # im_denoised = model(input)
 
         im_denoised = torch.floor(im_denoised+0.5).clamp(0.0, 255.0)/255.0
 
-        wa = os.path.dirname(save_way[0])
-        b1 = cnt//20
-        b2 = cnt%20
-        save_image(im_denoised, os.path.join(wa,"{:04d}_{:02d}.png".format(b1,b2)))
-        cnt += 1
+        if im_denoised.size() == label.size():
+            psnr = batch_PSNR(im_denoised, label)
+            ssim = batch_SSIM(im_denoised, label)
+            avg_psnr += psnr
+            avg_ssim += ssim
+            wa = os.path.dirname(save_way[0])
+            f = open(os.path.join(wa, "psnr.txt"), "a+")
+            f.write("{:.16f}\n".format(psnr))
+            f.close()
+            f = open(os.path.join(wa, "ssim.txt"), "a+")
+            f.write("{:.16f}\n".format(ssim))
+            f.close()
+            cnt += 1
+            save_image(im_denoised, os.path.join(wa,"img{:d}_psnr{:.2f}_ssim{:.4f}.png".format(cnt,psnr,ssim)))
+
+    avg_psnr, avg_ssim = avg_psnr / nums, avg_ssim / nums
+    print(f'>> PSNR:{avg_psnr:4.2f}, SSIM:{avg_ssim:5.4f}')
     return None
 
 if __name__ == '__main__':
@@ -93,11 +109,11 @@ if __name__ == '__main__':
             nparas += m.numel()
     print(f"loaded model '{args.model}'  nparas={nparas}")
 
-    imgs = sorted(os.listdir(args.in_dir))
-    noise_imgs = [os.path.join(args.in_dir, img) for img in imgs]
-    saved_imgs = [] if args.result_dir == '' else \
-        [os.path.join(args.result_dir, img) for img in imgs]
-    testset = SIDD_Ben_folder(noise_imgs, saved_imgs)
+    noise_imgs = natsorted(glob(args.in_dir))
+    clean_imgs = natsorted(glob(args.tg_dir))
+    saved_imgs = [os.path.join(args.result_dir, noise_img_i.split("/")[-1]) for noise_img_i in noise_imgs]
+
+    testset = DatasetForValidation(noise_imgs, clean_imgs, saved_imgs)
 
     print('start testing model ...')
     test(DataLoader(testset, 1), model)
