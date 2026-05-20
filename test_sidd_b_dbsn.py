@@ -80,7 +80,7 @@ def test(loader, model):
 
 if __name__ == '__main__':
     model = DBSNl(ids=args.ids).to(device)
-    checkpoint = torch.load(args.model, weights_only=True)
+    checkpoint = torch.load(args.model)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
     else:
